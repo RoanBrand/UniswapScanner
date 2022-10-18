@@ -125,7 +125,6 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 		return nil
 	}
 
-	//fmt.Println()
 	fmt.Println("TX:", receipt.TxHash.Hex())
 
 	swapInput, err := s.getSwapInput(tx.Data())
@@ -136,9 +135,6 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 	fmt.Println()
 	fmt.Println("Swap Input:")
 	spew.Dump(swapInput)
-	//fmt.Println()
-	//fmt.Println("Receipt:", receipt.TxHash)
-	//spew.Dump(receipt)
 
 	swapEv, err := s.getSwapEvent(receipt.Logs, swapInput)
 	if err != nil {
@@ -159,6 +155,7 @@ type poolSwap struct {
 	Out common.Address
 }
 
+// swapInput is the tokens, path (pools involved), and intended amounts of a trade.
 type swapInput struct {
 	Recipient common.Address
 	SwapToken common.Address
@@ -205,13 +202,6 @@ func (s *service) getSwapInput(txData []byte) (*swapInput, error) {
 	default:
 		return nil, errors.New("unhandled method: " + method.Name)
 	}
-
-	/*fmt.Println("method name:", method.Name)
-	//spew.Dump(tx)
-	fmt.Println()
-	fmt.Println("Inputs:")
-	spew.Dump(inputArgs)
-	fmt.Println()*/
 }
 
 func getSwapsFromMultiSwapPath(path []byte) (swaps []poolSwap, err error) {
@@ -220,7 +210,7 @@ func getSwapsFromMultiSwapPath(path []byte) (swaps []poolSwap, err error) {
 		return
 	}
 
-	swaps = make([]poolSwap, 1)
+	swaps = make([]poolSwap, 1, 2)
 
 	// swap token
 	swaps[0].In = common.BytesToAddress(path[:common.AddressLength])
@@ -236,8 +226,7 @@ func getSwapsFromMultiSwapPath(path []byte) (swaps []poolSwap, err error) {
 	// rx token from first pool
 	swaps[0].Out = common.BytesToAddress(path[iPath : iPath+common.AddressLength])
 	iPath += common.AddressLength
-
-	//var secondAddr common.Address
+	fmt.Println(swaps[0].Out.Hex())
 
 	// more hops
 	for iPath < len(path) {
@@ -306,6 +295,7 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte) (*swapInput,
 				Recipient:  params.Recipient,
 				SwapToken:  params.TokenIn,
 				RxToken:    params.TokenOut,
+				Path:       []poolSwap{{params.TokenIn, params.TokenOut}},
 				SwapAmount: params.AmountIn,
 				RxAmount:   params.AmountOutMinimum,
 				rxFixed:    false,
@@ -319,13 +309,12 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte) (*swapInput,
 			}
 			//spew.Dump("exactInput raw input:", paramsRaw, reflect.TypeOf(paramsRaw), reflect.ValueOf(paramsRaw))
 
-			paramsAnon := paramsRaw.(struct {
-				Path             []uint8        `json:"path"`
+			params := UniswapV3Router2.IV3SwapRouterExactInputParams(paramsRaw.(struct {
+				Path             []byte         `json:"path"`
 				Recipient        common.Address `json:"recipient"`
 				AmountIn         *big.Int       `json:"amountIn"`
 				AmountOutMinimum *big.Int       `json:"amountOutMinimum"`
-			})
-			params := UniswapV3Router2.IV3SwapRouterExactInputParams(paramsAnon)
+			}))
 
 			spew.Dump("exactInput params:", params)
 
@@ -368,6 +357,7 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte) (*swapInput,
 				Recipient:  params.Recipient,
 				SwapToken:  params.TokenIn,
 				RxToken:    params.TokenOut,
+				Path:       []poolSwap{{params.TokenIn, params.TokenOut}},
 				SwapAmount: params.AmountInMaximum,
 				RxAmount:   params.AmountOut,
 				rxFixed:    true,
@@ -381,6 +371,7 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte) (*swapInput,
 				Recipient:  inputArgs["to"].(common.Address),
 				SwapToken:  path[0],
 				RxToken:    path[len(path)-1],
+				Path:       []poolSwap{{path[0], path[len(path)-1]}},
 				SwapAmount: inputArgs["amountIn"].(*big.Int),
 				RxAmount:   inputArgs["amountOutMin"].(*big.Int),
 				rxFixed:    false,
@@ -394,6 +385,7 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte) (*swapInput,
 				Recipient:  inputArgs["to"].(common.Address),
 				SwapToken:  path[0],
 				RxToken:    path[len(path)-1],
+				Path:       []poolSwap{{path[0], path[len(path)-1]}},
 				SwapAmount: inputArgs["amountInMax"].(*big.Int),
 				RxAmount:   inputArgs["amountOut"].(*big.Int),
 				rxFixed:    true,
@@ -407,39 +399,76 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte) (*swapInput,
 	return nil, errors.New("failed to get swap input data from UniV3 Multicall")
 }
 
+// swapEvent has the actual amounts exchanged of a trade, after it got executed.
 type swapEvent struct {
 	Recipient  common.Address
 	SwapAmount *big.Int
 	RxAmount   *big.Int
 }
 
-func (s *service) getSwapEvent(logs []*types.Log, si *swapInput) (*swapEvent, error) {
+// need to get len(si.Path) 'Swap' events, otherwise error
+func (s *service) getSwapEvent(logs []*types.Log, si *swapInput) (finalSwap *swapEvent, err error) {
+	finalSwap = new(swapEvent)
+	swapEvCnt := 0
+
 	for _, l := range logs {
+		var ev *swapEvent
+
 		if t := l.Topics[0].Hex(); t == uni3SwapEventTopic {
-			//s.got = true
-			return s.decodeUni3Log(l, si)
+			ev, err = s.decodeUniV3SwapEventLog(l, &si.Path[swapEvCnt])
+			if err != nil {
+				return nil, errors.WithMessage(err, "failed to decode uniswapV3 Swap event log")
+			}
 		} else if t == uni2SwapEventTopic {
-			return s.decodeUni2Log(l)
+			ev, err = s.decodeUniV2SwapEventLog(l)
+			if err != nil {
+				return nil, errors.WithMessage(err, "failed to decode uniswapV2 Swap event log")
+			}
+		} else {
+			fmt.Println("warn: uniV3 event log not handled:", t)
+			continue
 		}
+
+		if swapEvCnt == 0 {
+			finalSwap.SwapAmount = ev.SwapAmount
+
+			if !si.rxFixed && ev.SwapAmount.Cmp(si.SwapAmount) != 0 {
+				log.Println("wat check swap amount: ", si.SwapAmount.String(), ev.SwapAmount.String())
+			}
+		} else if swapEvCnt == len(si.Path)-1 {
+			finalSwap.Recipient = ev.Recipient
+			finalSwap.RxAmount = ev.RxAmount
+
+			if si.rxFixed && ev.RxAmount.Cmp(si.RxAmount) != 0 {
+				log.Println("wat check rx amount: ", si.RxAmount.String(), ev.RxAmount.String())
+			}
+		}
+
+		swapEvCnt++
 	}
 
-	return nil, errors.New("swap event not found in logs")
+	if swapEvCnt != len(si.Path) {
+		return nil, fmt.Errorf("tx event logs contains %d out of %d needed Swap logs", swapEvCnt, len(si.Path))
+	}
+
+	// cannot check last swap event recepient as in univ2 it is routerAddr and not traderAddr
+	return
 }
 
-func (s *service) decodeUni3Log(l *types.Log, si *swapInput) (*swapEvent, error) {
+func (s *service) decodeUniV3SwapEventLog(l *types.Log, ps *poolSwap) (*swapEvent, error) {
 	ev, err := s.abiV3Pool.EventByID(l.Topics[0])
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get V3Pool event")
+		return nil, errors.Wrap(err, "failed to get event")
 	}
 
 	if ev.Name != "Swap" {
-		return nil, errors.New("failed to get V3Pool Swap event. Is: " + ev.Name)
+		return nil, errors.New("not Swap. Is: " + ev.Name)
 	}
 
 	var uni3PoolSwap UniswapV3Pool.UniswapV3PoolSwap
 	err = s.abiV3Pool.UnpackIntoInterface(&uni3PoolSwap, "Swap", l.Data)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to unpack V3Pool Swap event data")
+		return nil, errors.Wrap(err, "failed to unpack event data")
 	}
 
 	var indexed abi.Arguments
@@ -451,13 +480,13 @@ func (s *service) decodeUni3Log(l *types.Log, si *swapInput) (*swapEvent, error)
 
 	err = abi.ParseTopics(&uni3PoolSwap, indexed, l.Topics[1:])
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse V3Pool Swap event topics")
+		return nil, errors.Wrap(err, "failed to parse topics")
 	}
 
 	//uni3PoolSwap.Raw = *l
 
 	fmt.Println()
-	fmt.Println("uni3 swap deets")
+	fmt.Println("uni3 raw swap log deets:")
 	spew.Dump(&uni3PoolSwap)
 	fmt.Println()
 
@@ -465,7 +494,8 @@ func (s *service) decodeUni3Log(l *types.Log, si *swapInput) (*swapEvent, error)
 		Recipient: uni3PoolSwap.Recipient,
 	}
 
-	if bytes.Compare(si.SwapToken.Bytes(), si.RxToken.Bytes()) == 1 {
+	// with Uniswap V3: token0 is the one with the smaller address value.
+	if bytes.Compare(ps.In.Bytes(), ps.Out.Bytes()) == 1 {
 		se.SwapAmount = uni3PoolSwap.Amount1
 		se.RxAmount = new(big.Int).Abs(uni3PoolSwap.Amount0)
 	} else {
@@ -476,14 +506,14 @@ func (s *service) decodeUni3Log(l *types.Log, si *swapInput) (*swapEvent, error)
 	return &se, nil
 }
 
-func (s *service) decodeUni2Log(l *types.Log) (*swapEvent, error) {
+func (s *service) decodeUniV2SwapEventLog(l *types.Log) (*swapEvent, error) {
 	ev, err := s.abiV2Pair.EventByID(l.Topics[0])
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get V2Pair event")
+		return nil, errors.Wrap(err, "failed to get event")
 	}
 
 	if ev.Name != "Swap" {
-		return nil, errors.New("failed to get v2Pair Swap event. Is: " + ev.Name)
+		return nil, errors.New("not Swap. Is: " + ev.Name)
 	}
 
 	/*fmt.Println()
@@ -494,11 +524,10 @@ func (s *service) decodeUni2Log(l *types.Log) (*swapEvent, error) {
 	var uni2PairSwap UniswapV2Pair.UniswapV2PairSwap
 	err = s.abiV2Pair.UnpackIntoInterface(&uni2PairSwap, "Swap", l.Data)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to unpack V2Pair Swap event data")
+		return nil, errors.Wrap(err, "failed to unpack event data")
 	}
 
 	var indexed abi.Arguments
-	//fmt.Printf("swap event inputs: %+v\n", ev.Inputs)
 	for _, arg := range ev.Inputs {
 		if arg.Indexed {
 			indexed = append(indexed, arg)
@@ -507,7 +536,7 @@ func (s *service) decodeUni2Log(l *types.Log) (*swapEvent, error) {
 
 	err = abi.ParseTopics(&uni2PairSwap, indexed, l.Topics[1:])
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse V2Pair Swap event topics")
+		return nil, errors.Wrap(err, "failed to parse topics")
 	}
 
 	//uni2PairSwap.Raw = *l
