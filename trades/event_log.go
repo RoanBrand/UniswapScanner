@@ -47,7 +47,7 @@ type tradedAmounts struct {
 }
 
 // build/get final amounts debited from and credited to trading wallet during the trade.
-func (s *service) getTradedAmounts(logs []*types.Log, sender common.Address, si *swapInput) (final *tradedAmounts, err error) {
+func (s *service) getTradedAmounts(logs []*types.Log, sender common.Address, si *tradeParams) (final *tradedAmounts, err error) {
 	final = &tradedAmounts{
 		SwapAmount: new(big.Int),
 		RxAmount:   new(big.Int),
@@ -57,17 +57,20 @@ func (s *service) getTradedAmounts(logs []*types.Log, sender common.Address, si 
 		switch l.Topics[0].Hex() {
 		case uni3EventTopicDeposit:
 			if isTheSame(l.Address, si.SwapToken) {
-				if final.SwapAmount.Cmp(zero) != 0 {
+				/*if final.SwapAmount.Cmp(zero) != 0 {
 					return nil, errors.Errorf("event Deposit: swapAmount already populated with %s, want to put in %s", final.SwapAmount.String(), new(big.Int).SetBytes(l.Data).String())
 				}
-				final.SwapAmount = new(big.Int).SetBytes(l.Data)
+				final.SwapAmount = new(big.Int).SetBytes(l.Data)*/
+				final.SwapAmount.Add(final.SwapAmount, new(big.Int).SetBytes(l.Data))
 			}
 		case uni3EventTopicWithdraw:
 			if isTheSame(l.Address, si.RxToken) && isTheSameHashLogAndHexAddress(l.Topics[1], uniV3Addr) {
-				if final.RxAmount.Cmp(zero) != 0 {
+				/*if final.RxAmount.Cmp(zero) != 0 {
 					return nil, errors.Errorf("event Withdraw: rxAmount already populated with %s, want to put in %s", final.RxAmount.String(), new(big.Int).SetBytes(l.Data).String())
 				}
-				final.RxAmount = new(big.Int).SetBytes(l.Data)
+				final.RxAmount = new(big.Int).SetBytes(l.Data)*/
+				final.RxAmount.Add(final.RxAmount, new(big.Int).SetBytes(l.Data))
+				final.Recipient = sender
 			}
 		case uni3EventTopicTransfer:
 			if isTheSame(l.Address, si.SwapToken) {
@@ -85,6 +88,9 @@ func (s *service) getTradedAmounts(logs []*types.Log, sender common.Address, si 
 					}
 					final.RxAmount = new(big.Int).SetBytes(l.Data)*/
 					final.RxAmount.Add(final.RxAmount, new(big.Int).SetBytes(l.Data))
+					final.Recipient = sender
+				} else {
+					final.Recipient = common.BytesToAddress(l.Topics[2].Bytes()) // other receiver of trade proceeds
 				}
 			}
 
@@ -127,7 +133,7 @@ func isTheSameHashLogAndHexAddress(logHash common.Hash, addr string) bool {
 	return common.BytesToAddress(logHash.Bytes()).Hex() == addr
 }
 
-func (s *service) decodeUniV3SwapEventLog(l *types.Log, ps *poolSwap) (*tradedAmounts, error) {
+func (s *service) decodeUniV3SwapEventLog(l *types.Log, ps *poolHop) (*tradedAmounts, error) {
 	ev, err := s.abiV3Pool.EventByID(l.Topics[0])
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get event")

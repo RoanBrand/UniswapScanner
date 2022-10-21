@@ -11,8 +11,8 @@ import (
 	"github.com/RoanBrand/UniswapScanner/abi/UniswapV2Pair"
 	"github.com/RoanBrand/UniswapScanner/abi/UniswapV3Pool"
 	"github.com/RoanBrand/UniswapScanner/abi/UniswapV3Router2"
-
 	"github.com/davecgh/go-spew/spew"
+
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -25,7 +25,7 @@ const (
 	uniV3Addr = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
 
 	confirmations uint64 = 267 // only scan up to (tip - confirmations)
-	startBlock    uint64 = 15767619
+	startBlock    uint64 = 15767636
 )
 
 var zero = new(big.Int)
@@ -143,25 +143,44 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 		return nil
 	}
 
-	fmt.Println("New TX:", receipt.TxHash.Hex())
-
-	swapInput, err := s.getSwapInput(tx.Data())
-	if err != nil {
-		return errors.Wrap(err, "failed to get and decode method input args")
-	}
-
 	fmt.Println()
-	fmt.Println("Swap Input:")
-	spew.Dump(swapInput)
+	fmt.Println("New TX:", receipt.TxHash.Hex())
 
 	sender, err := getTxSender(tx)
 	if err != nil {
 		return errors.Wrap(err, "failed to get TX sender")
 	}
 
+	swapInput, err := s.getSwapInput(tx.Data(), sender)
+	if err != nil {
+		return errors.Wrap(err, "failed to get and decode method input args")
+	}
+
+	/*fmt.Println()
+	fmt.Println("Swap Input:")
+	spew.Dump(swapInput)*/
+
+	/*if !isTheSame(swapInput.Recipient, sender) {
+		return errors.New("CHECK. not sender")
+	}*/
+
 	tradedAmounts, err := s.getTradedAmounts(receipt.Logs, sender, swapInput)
 	if err != nil {
 		return err
+	}
+
+	if isTheSame(tradedAmounts.Recipient, common.Address{}) {
+		// not set
+		fmt.Println("Swap Input:")
+		spew.Dump(swapInput)
+		fmt.Println()
+		fmt.Println("Final Traded amounts:")
+		spew.Dump(tradedAmounts)
+		return errors.New("CHECK. recipient not set")
+	}
+
+	if !isTheSame(tradedAmounts.Recipient, sender) {
+		return nil // ignore traders on behalf of other wallets
 	}
 
 	// to check things while building/debugging:
@@ -173,7 +192,8 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 			if res > 0 {
 				fmt.Printf("input %s larger than received token %s. Probable reflection token\n", swapInput.RxAmount.String(), tradedAmounts.RxAmount.String())
 			} else {
-				return errors.Errorf("CHECK! Wanted received amount %s not gotten %s", swapInput.RxAmount.String(), tradedAmounts.RxAmount.String())
+				//return errors.Errorf("CHECK! Wanted received amount %s not gotten %s", swapInput.RxAmount.String(), tradedAmounts.RxAmount.String())
+				fmt.Printf("received amount %s larger than requested fixed %s\n", tradedAmounts.RxAmount.String(), swapInput.RxAmount.String())
 			}
 		}
 	} else {
@@ -197,9 +217,9 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 		return errors.New("SwapAmount not populated 2")
 	}
 
-	fmt.Println("Final Traded amounts:")
+	/*fmt.Println("Final Traded amounts:")
 	spew.Dump(tradedAmounts)
-	fmt.Println()
+	fmt.Println()*/
 
 	return nil
 }
