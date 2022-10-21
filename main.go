@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/RoanBrand/UniswapScanner/abi/UniswapV2Pair"
 	"github.com/RoanBrand/UniswapScanner/abi/UniswapV3Pool"
@@ -24,16 +25,36 @@ import (
 )
 
 const (
-	web3Url   = ""
+	web3Url   = "https://mainnet.infura.io/v3/ca1921f56f88442cadfca449d53afeef"
 	uniV3Addr = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
 
-	confirmations uint64 = 267
-
-	uni2SwapEventTopic = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
-	uni3SwapEventTopic = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+	confirmations uint64 = 267 // only scan up to (tip - confirmations)
+	startBlock    uint64 = 15767619
 )
 
-var ()
+const (
+	// Swap (index_topic_1 address sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, index_topic_2 address to)
+	uni2EventTopicSwap = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+
+	uni3EventTopicSwap = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+
+	// Transfer (index_topic_1 address from, index_topic_2 address to, uint256 value)
+	uni3EventTopicTransfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+	// Approval (index_topic_1 address owner, index_topic_2 address spender, uint256 value)
+	uni3EventTopicApproval = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
+
+	// Sync (uint112 reserve0, uint112 reserve1)
+	uni3EventTopicSync = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1"
+
+	// Deposit (index_topic_1 address dst, uint256 wad)
+	// WETH9
+	uni3EventTopicDeposit = "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c"
+
+	// Withdrawal (index_topic_1 address src, uint256 wad)
+	// WETH9
+	uni3EventTopicWithdraw = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"
+)
 
 type service struct {
 	ctx context.Context
@@ -43,7 +64,8 @@ type service struct {
 	abiV3Pool   *abi.ABI
 	abiV2Pair   *abi.ABI
 
-	got bool
+	timer     *time.Timer
+	nextBlock uint64 // to scan
 }
 
 func main() {
@@ -77,34 +99,71 @@ func main() {
 
 	defer c.Close()
 
-	s := service{ctx, c, &abiV3Router, &abiV3Pool, &abiV2Pair, false}
+	s := service{ctx, c, &abiV3Router, &abiV3Pool, &abiV2Pair, time.NewTimer(0), startBlock}
 
-	/*header, err := c.HeaderByNumber(ctx, nil)
-	if err != nil {
-		log.Println(errors.Wrap(err, "failed to get latest block"))
-		return
-	}*/
-
-	blockN := uint64(15767617) //header.Number.Uint64() - confirmations
-	block, err := c.BlockByNumber(ctx, new(big.Int).SetUint64(blockN))
-	if err != nil {
-		log.Println(errors.Wrapf(err, "failed to get block %d from node", blockN))
+	if err = s.run(); err != nil {
+		if errors.Is(err, context.Canceled) {
+			fmt.Println("user wants to exit")
+		} else {
+			fmt.Println("service error:", err)
+		}
 		return
 	}
 
-	for _, tx := range block.Transactions() {
-		if err = s.decodeTx(tx); err != nil {
-			log.Println(errors.Wrap(err, "failed to decode tx"))
-			return
+}
+
+func (s *service) run() error {
+	for {
+		header, err := s.c.HeaderByNumber(s.ctx, nil)
+		if err != nil {
+			return errors.Wrap(err, "failed to get latest block")
 		}
 
-		if s.got {
-			log.Println("early exit")
-			return // temp only one
+		maxBlockN := header.Number.Uint64() - confirmations
+		if s.nextBlock > maxBlockN {
+			log.Printf("Finished scanning up to latest block %d\nSleeping for a while..", s.nextBlock-1)
+			if err = s.sleepCtx(time.Minute * 5); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err = s.processBlocks(maxBlockN); err != nil {
+			fmt.Println("failed to process Block:", err)
+			if err = s.sleepCtx(time.Minute * 5); err != nil {
+				return err
+			}
 		}
 	}
+}
 
-	log.Printf("Finished scanning all TXs in block %d \n", blockN)
+func (s *service) processBlocks(uptTo uint64) error {
+	for {
+		block, err := s.c.BlockByNumber(s.ctx, new(big.Int).SetUint64(s.nextBlock))
+		if err != nil {
+			return errors.Wrapf(err, "failed to get block %d from node", s.nextBlock)
+		}
+
+		fmt.Printf("\n\nBlock %d:\n***************************************************\n", s.nextBlock)
+		err = s.decodeBlockTXs(block.Transactions(), s.nextBlock)
+		if err != nil {
+			return errors.Wrap(err, "failed to decode Block")
+		}
+
+		s.nextBlock++
+		if s.nextBlock > uptTo {
+			return nil
+		}
+	}
+}
+
+func (s *service) decodeBlockTXs(txs types.Transactions, upToBlock uint64) error {
+	for _, tx := range txs {
+		if err := s.decodeTx(tx); err != nil {
+			return errors.Wrap(err, "failed to decode tx")
+		}
+	}
+	return nil
 }
 
 func (s *service) decodeTx(tx *types.Transaction) error {
@@ -125,7 +184,7 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 		return nil
 	}
 
-	fmt.Println("TX:", receipt.TxHash.Hex())
+	fmt.Println("New TX:", receipt.TxHash.Hex())
 
 	swapInput, err := s.getSwapInput(tx.Data())
 	if err != nil {
@@ -136,16 +195,66 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 	fmt.Println("Swap Input:")
 	spew.Dump(swapInput)
 
-	swapEv, err := s.getSwapEvent(receipt.Logs, swapInput)
+	sender, err := getTxSender(tx)
+	if err != nil {
+		return errors.Wrap(err, "failed to get TX sender")
+	}
+
+	tradedAmounts, err := s.getTradedAmounts(receipt.Logs, sender, swapInput)
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("Swap Event:")
-	spew.Dump(swapEv)
+	// to check things while building/debugging:
+	if swapInput.rxFixed {
+		if tradedAmounts.RxAmount.Cmp(zero) == 0 {
+			return errors.New("RxAmount not populated")
+		}
+		if res := swapInput.RxAmount.Cmp(tradedAmounts.RxAmount); res != 0 {
+			if res > 0 {
+				fmt.Printf("input %s larger than received token %s. Probable reflection token\n", swapInput.RxAmount.String(), tradedAmounts.RxAmount.String())
+			} else {
+				return errors.Errorf("CHECK! Wanted received amount %s not gotten %s", swapInput.RxAmount.String(), tradedAmounts.RxAmount.String())
+			}
+		}
+	} else {
+		if tradedAmounts.SwapAmount.Cmp(zero) == 0 {
+			return errors.New("SwapAmount not populated")
+		}
+		if res := swapInput.SwapAmount.Cmp(tradedAmounts.SwapAmount); res != 0 {
+			if res > 0 {
+				fmt.Printf("input %s larger than swapped token %s. Probable reflection token\n", swapInput.SwapAmount.String(), tradedAmounts.SwapAmount.String())
+			} else {
+				return errors.Errorf("CHECK! Wanted swap amount %s not traded %s", swapInput.SwapAmount.String(), tradedAmounts.SwapAmount.String())
+			}
+
+		}
+	}
+
+	if tradedAmounts.RxAmount.Cmp(zero) == 0 {
+		return errors.New("RxAmount not populated 2")
+	}
+	if tradedAmounts.SwapAmount.Cmp(zero) == 0 {
+		return errors.New("SwapAmount not populated 2")
+	}
+
+	fmt.Println("Final Traded amounts:")
+	spew.Dump(tradedAmounts)
 	fmt.Println()
 
 	return nil
+}
+
+func getTxSender(tx *types.Transaction) (from common.Address, err error) {
+	var msg types.Message
+	msg, err = tx.AsMessage(types.LatestSignerForChainID(tx.ChainId()), nil)
+	if err != nil {
+		return
+	}
+
+	from = msg.From()
+	fmt.Println("TX Sender:", from)
+	return
 }
 
 // poolSwap is a single swap (with a pool),
@@ -367,6 +476,8 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte) (*swapInput,
 			fmt.Println("is UniV2 swapExactTokensForTokens")
 			path := inputArgs["path"].([]common.Address)
 
+			spew.Dump("swapExactTokensForTokens path", path)
+
 			return &swapInput{
 				Recipient:  inputArgs["to"].(common.Address),
 				SwapToken:  path[0],
@@ -399,63 +510,83 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte) (*swapInput,
 	return nil, errors.New("failed to get swap input data from UniV3 Multicall")
 }
 
-// swapEvent has the actual amounts exchanged of a trade, after it got executed.
-type swapEvent struct {
+// tradedAmounts has the actual amounts exchanged of a trade, after it got executed.
+type tradedAmounts struct {
 	Recipient  common.Address
 	SwapAmount *big.Int
 	RxAmount   *big.Int
 }
 
-// need to get len(si.Path) 'Swap' events, otherwise error
-func (s *service) getSwapEvent(logs []*types.Log, si *swapInput) (finalSwap *swapEvent, err error) {
-	finalSwap = new(swapEvent)
-	swapEvCnt := 0
+var zero = new(big.Int)
+
+// build/get final amounts debited from and credited to trading wallet during the trade.
+func (s *service) getTradedAmounts(logs []*types.Log, sender common.Address, si *swapInput) (final *tradedAmounts, err error) {
+	final = &tradedAmounts{
+		SwapAmount: new(big.Int),
+		RxAmount:   new(big.Int),
+	}
 
 	for _, l := range logs {
-		var ev *swapEvent
+		switch l.Topics[0].Hex() {
+		case uni3EventTopicDeposit:
+			if isTheSame(l.Address, si.SwapToken) {
+				if final.SwapAmount.Cmp(zero) != 0 {
+					return nil, errors.Errorf("event Deposit: swapAmount already populated with %s, want to put in %s", final.SwapAmount.String(), new(big.Int).SetBytes(l.Data).String())
+				}
+				final.SwapAmount = new(big.Int).SetBytes(l.Data)
+			}
+		case uni3EventTopicWithdraw:
+			if isTheSame(l.Address, si.RxToken) && isTheSameHashLogAndHexAddress(l.Topics[1], uniV3Addr) {
+				if final.RxAmount.Cmp(zero) != 0 {
+					return nil, errors.Errorf("event Withdraw: rxAmount already populated with %s, want to put in %s", final.RxAmount.String(), new(big.Int).SetBytes(l.Data).String())
+				}
+				final.RxAmount = new(big.Int).SetBytes(l.Data)
+			}
+		case uni3EventTopicTransfer:
+			if isTheSame(l.Address, si.SwapToken) {
+				if isTheSameHashLogAndAddress(l.Topics[1], sender) {
+					/*if final.SwapAmount != nil {
+						return nil, errors.Errorf("event Transfer: swapAmount already populated with %s, want to put in %s", final.SwapAmount.String(), new(big.Int).SetBytes(l.Data).String())
+					}
+					final.SwapAmount = new(big.Int).SetBytes(l.Data)*/
+					final.SwapAmount.Add(final.SwapAmount, new(big.Int).SetBytes(l.Data))
+				}
+			} else if isTheSame(l.Address, si.RxToken) {
+				if isTheSameHashLogAndAddress(l.Topics[2], sender) {
+					/*if final.RxAmount != nil {
+						return nil, errors.Errorf("event Transfer: rxAmount already populated with %s, want to put in %s", final.RxAmount.String(), new(big.Int).SetBytes(l.Data).String())
+					}
+					final.RxAmount = new(big.Int).SetBytes(l.Data)*/
+					final.RxAmount.Add(final.RxAmount, new(big.Int).SetBytes(l.Data))
+				}
+			}
 
-		if t := l.Topics[0].Hex(); t == uni3SwapEventTopic {
-			ev, err = s.decodeUniV3SwapEventLog(l, &si.Path[swapEvCnt])
+		// ignore 'Swap' events as they do not always match trade paths 1-1, and can perform additional trades depending on their custom logic.
+		case uni3EventTopicSwap:
+			/*ta, err = s.decodeUniV3SwapEventLog(l, &si.Path[swapEvCnt])
 			if err != nil {
 				return nil, errors.WithMessage(err, "failed to decode uniswapV3 Swap event log")
-			}
-		} else if t == uni2SwapEventTopic {
-			ev, err = s.decodeUniV2SwapEventLog(l)
+			}*/
+		case uni2EventTopicSwap:
+			/*ta, err = s.decodeUniV2SwapEventLog(l)
 			if err != nil {
 				return nil, errors.WithMessage(err, "failed to decode uniswapV2 Swap event log")
-			}
-		} else {
-			fmt.Println("warn: uniV3 event log not handled:", t)
+			}*/
+
+		// ignore known but not useful events
+		case uni3EventTopicApproval,
+			uni3EventTopicSync:
+			continue
+		default:
+			fmt.Println("warn: uniV3 event log not handled:", l.Topics[0].Hex())
 			continue
 		}
-
-		if swapEvCnt == 0 {
-			finalSwap.SwapAmount = ev.SwapAmount
-
-			if !si.rxFixed && ev.SwapAmount.Cmp(si.SwapAmount) != 0 {
-				log.Println("wat check swap amount: ", si.SwapAmount.String(), ev.SwapAmount.String())
-			}
-		} else if swapEvCnt == len(si.Path)-1 {
-			finalSwap.Recipient = ev.Recipient
-			finalSwap.RxAmount = ev.RxAmount
-
-			if si.rxFixed && ev.RxAmount.Cmp(si.RxAmount) != 0 {
-				log.Println("wat check rx amount: ", si.RxAmount.String(), ev.RxAmount.String())
-			}
-		}
-
-		swapEvCnt++
 	}
 
-	if swapEvCnt != len(si.Path) {
-		return nil, fmt.Errorf("tx event logs contains %d out of %d needed Swap logs", swapEvCnt, len(si.Path))
-	}
-
-	// cannot check last swap event recepient as in univ2 it is routerAddr and not traderAddr
 	return
 }
 
-func (s *service) decodeUniV3SwapEventLog(l *types.Log, ps *poolSwap) (*swapEvent, error) {
+func (s *service) decodeUniV3SwapEventLog(l *types.Log, ps *poolSwap) (*tradedAmounts, error) {
 	ev, err := s.abiV3Pool.EventByID(l.Topics[0])
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get event")
@@ -490,11 +621,11 @@ func (s *service) decodeUniV3SwapEventLog(l *types.Log, ps *poolSwap) (*swapEven
 	spew.Dump(&uni3PoolSwap)
 	fmt.Println()
 
-	se := swapEvent{
+	se := tradedAmounts{
 		Recipient: uni3PoolSwap.Recipient,
 	}
 
-	// with Uniswap V3: token0 is the one with the smaller address value.
+	// with Uniswap V3: token0 is always the one with the smaller address value.
 	if bytes.Compare(ps.In.Bytes(), ps.Out.Bytes()) == 1 {
 		se.SwapAmount = uni3PoolSwap.Amount1
 		se.RxAmount = new(big.Int).Abs(uni3PoolSwap.Amount0)
@@ -506,7 +637,7 @@ func (s *service) decodeUniV3SwapEventLog(l *types.Log, ps *poolSwap) (*swapEven
 	return &se, nil
 }
 
-func (s *service) decodeUniV2SwapEventLog(l *types.Log) (*swapEvent, error) {
+func (s *service) decodeUniV2SwapEventLog(l *types.Log) (*tradedAmounts, error) {
 	ev, err := s.abiV2Pair.EventByID(l.Topics[0])
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get event")
@@ -546,7 +677,7 @@ func (s *service) decodeUniV2SwapEventLog(l *types.Log) (*swapEvent, error) {
 	spew.Dump(&uni2PairSwap)
 	fmt.Println()*/
 
-	return &swapEvent{
+	return &tradedAmounts{
 		uni2PairSwap.To,
 		uni2SwapAmount(&uni2PairSwap),
 		uni2RxAmount(&uni2PairSwap),
@@ -555,12 +686,12 @@ func (s *service) decodeUniV2SwapEventLog(l *types.Log) (*swapEvent, error) {
 
 func uni2SwapAmount(u *UniswapV2Pair.UniswapV2PairSwap) *big.Int {
 	if u.Amount0In != nil && u.Amount0In.Uint64() != 0 {
-		fmt.Println("uni2 swap event amount0In used")
+		//fmt.Println("uni2 swap event amount0In used")
 		return u.Amount0In
 	}
 
 	if u.Amount1In != nil && u.Amount1In.Uint64() != 0 {
-		fmt.Println("uni2 swap event amount1In used")
+		//fmt.Println("uni2 swap event amount1In used")
 		return u.Amount1In
 	}
 
@@ -570,15 +701,46 @@ func uni2SwapAmount(u *UniswapV2Pair.UniswapV2PairSwap) *big.Int {
 
 func uni2RxAmount(u *UniswapV2Pair.UniswapV2PairSwap) *big.Int {
 	if u.Amount0Out != nil && u.Amount0Out.Uint64() != 0 {
-		fmt.Println("uni2 swap event Amount0Out used")
+		//fmt.Println("uni2 swap event Amount0Out used")
 		return u.Amount0Out
 	}
 
 	if u.Amount1Out != nil && u.Amount1Out.Uint64() != 0 {
-		fmt.Println("uni2 swap event Amount1Out used")
+		//fmt.Println("uni2 swap event Amount1Out used")
 		return u.Amount1Out
 	}
 
 	fmt.Println("CHECK! uni2 swap event no AmountOut!")
 	return nil
+}
+
+func (s *service) sleepCtx(d time.Duration) error {
+	if !s.timer.Stop() {
+		<-s.timer.C
+	}
+	s.timer.Reset(d)
+
+	select {
+	case <-s.ctx.Done():
+		if !s.timer.Stop() {
+			<-s.timer.C
+		}
+		return s.ctx.Err()
+	case <-s.timer.C:
+		return nil
+	}
+}
+
+func isTheSame(addr1, addr2 common.Address) bool {
+	return bytes.Equal(addr1.Bytes(), addr2.Bytes())
+}
+
+// quick helper with no allocation
+// old: isTheSame(common.BytesToAddress(logHash.Bytes()), addr)
+func isTheSameHashLogAndAddress(logHash common.Hash, addr common.Address) bool {
+	return bytes.Equal(addr.Bytes(), logHash.Bytes()[common.HashLength-common.AddressLength:])
+}
+
+func isTheSameHashLogAndHexAddress(logHash common.Hash, addr string) bool {
+	return common.BytesToAddress(logHash.Bytes()).Hex() == addr
 }
