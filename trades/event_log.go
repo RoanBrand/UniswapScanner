@@ -89,8 +89,6 @@ func (s *service) getTradedAmounts(logs []*types.Log, sender common.Address, si 
 					final.RxAmount = new(big.Int).SetBytes(l.Data)*/
 					final.RxAmount.Add(final.RxAmount, new(big.Int).SetBytes(l.Data))
 					final.Recipient = sender
-				} else {
-					final.Recipient = common.BytesToAddress(l.Topics[2].Bytes()) // other receiver of trade proceeds
 				}
 			}
 

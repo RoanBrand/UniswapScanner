@@ -25,7 +25,7 @@ const (
 	uniV3Addr = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
 
 	confirmations uint64 = 267 // only scan up to (tip - confirmations)
-	startBlock    uint64 = 15767636
+	startBlock    uint64 = 15767654
 )
 
 var zero = new(big.Int)
