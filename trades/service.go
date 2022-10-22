@@ -179,10 +179,6 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 		return errors.New("CHECK. recipient not set")
 	}
 
-	if !isTheSame(tradedAmounts.Recipient, sender) {
-		return nil // ignore traders on behalf of other wallets
-	}
-
 	// to check things while building/debugging:
 	if swapInput.rxFixed {
 		if tradedAmounts.RxAmount.Cmp(zero) == 0 {
@@ -206,7 +202,6 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 			} else {
 				return errors.Errorf("CHECK! Wanted swap amount %s not traded %s", swapInput.SwapAmount.String(), tradedAmounts.SwapAmount.String())
 			}
-
 		}
 	}
 
@@ -215,6 +210,11 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 	}
 	if tradedAmounts.SwapAmount.Cmp(zero) == 0 {
 		return errors.New("SwapAmount not populated 2")
+	}
+
+	if !isTheSame(tradedAmounts.Recipient, sender) {
+		fmt.Println("recipient", tradedAmounts.Recipient, "not the same as sender. ignoring trade")
+		return nil // ignore traders on behalf of other wallets
 	}
 
 	/*fmt.Println("Final Traded amounts:")

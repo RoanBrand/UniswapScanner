@@ -21,7 +21,7 @@ type tradeParams struct {
 	Recipient common.Address
 	SwapToken common.Address
 	RxToken   common.Address
-	Path      []poolHop // all swaps (pools) from swapT to rxT
+	Path      []*poolHop // all swaps (pools) from swapT to rxT
 
 	SwapAmount *big.Int // AmountIn / AmountInMax
 	RxAmount   *big.Int // AmountOut / AmountOutMin
@@ -128,7 +128,7 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender commo
 					final.RxAmount.Add(final.RxAmount, params.AmountOutMinimum)
 					// intermediate new hop
 				} else if isTheSame(params.TokenIn, final.RxToken) {
-					final.Path = append(final.Path, poolHop{final.RxToken, params.TokenOut})
+					final.Path = append(final.Path, &poolHop{final.RxToken, params.TokenOut})
 					final.RxToken = params.TokenOut // update
 					final.RxAmount = params.AmountOutMinimum
 					// same intermediary hop
@@ -140,23 +140,13 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender commo
 			} else {
 				final.SwapToken = params.TokenIn
 				final.RxToken = params.TokenOut
-				final.Path = []poolHop{{params.TokenIn, params.TokenOut}}
+				final.Path = []*poolHop{{params.TokenIn, params.TokenOut}}
 				final.SwapAmount = params.AmountIn
 				final.RxAmount = params.AmountOutMinimum
 				final.rxFixed = false
 
 				firstTradeSet = true
 			}
-
-			/*return &tradeParams{
-				Recipient:  params.Recipient,
-				SwapToken:  params.TokenIn,
-				RxToken:    params.TokenOut,
-				Path:       []poolHop{{params.TokenIn, params.TokenOut}},
-				SwapAmount: params.AmountIn,
-				RxAmount:   params.AmountOutMinimum,
-				rxFixed:    false,
-			}, nil*/
 
 		case "exactInput":
 			fmt.Println("has UniV3 exactInput")
@@ -174,9 +164,9 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender commo
 
 			//spew.Dump("exactInput input params:", params)
 
-			swaps, err := getSwapsFromMultiSwapPath(params.Path)
+			hops, err := getHopsFromMultiSwapPath(params.Path, false)
 			if err != nil {
-				return nil, errors.WithMessage(err, "failed to decode MultiSwap Path arg")
+				return nil, errors.Wrap(err, "failed to decode MultiSwap Path arg")
 			}
 
 			//spew.Dump("with paths:", swaps)
@@ -186,40 +176,30 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender commo
 
 			if firstTradeSet {
 				// same initial hop
-				if isTheSame(swaps[0].In, final.SwapToken) && isTheSame(swaps[len(swaps)-1].Out, final.RxToken) {
+				if isTheSame(hops[0].In, final.SwapToken) && isTheSame(hops[len(hops)-1].Out, final.RxToken) {
 					final.SwapAmount.Add(final.SwapAmount, params.AmountIn)
 					final.RxAmount.Add(final.RxAmount, params.AmountOutMinimum)
 					// new intermediary hop
-				} else if isTheSame(swaps[0].In, final.RxToken) {
-					final.Path = append(final.Path, poolHop{final.RxToken, swaps[len(swaps)-1].Out})
-					final.RxToken = swaps[len(swaps)-1].Out // update
+				} else if isTheSame(hops[0].In, final.RxToken) {
+					final.Path = append(final.Path, &poolHop{final.RxToken, hops[len(hops)-1].Out})
+					final.RxToken = hops[len(hops)-1].Out // update
 					final.RxAmount = params.AmountOutMinimum
 					// same intermediary hop
-				} else if isTheSame(swaps[len(swaps)-1].Out, final.RxToken) {
+				} else if isTheSame(hops[len(hops)-1].Out, final.RxToken) {
 					final.RxAmount.Add(final.RxAmount, params.AmountOutMinimum)
 				} else {
 					return nil, errors.New("unhandled")
 				}
 			} else {
-				final.SwapToken = swaps[0].In
-				final.RxToken = swaps[len(swaps)-1].Out
-				final.Path = swaps
+				final.SwapToken = hops[0].In
+				final.RxToken = hops[len(hops)-1].Out
+				final.Path = hops
 				final.SwapAmount = params.AmountIn
 				final.RxAmount = params.AmountOutMinimum
 				final.rxFixed = false
 
 				firstTradeSet = true
 			}
-
-			/*return &tradeParams{
-				Recipient:  params.Recipient,
-				SwapToken:  swaps[0].In,
-				RxToken:    swaps[len(swaps)-1].Out,
-				Path:       swaps,
-				SwapAmount: params.AmountIn,
-				RxAmount:   params.AmountOutMinimum,
-				rxFixed:    false,
-			}, nil*/
 
 		case "exactOutputSingle":
 			fmt.Println("has UniV3 exactOutputSingle")
@@ -251,7 +231,7 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender commo
 					final.RxAmount.Add(final.RxAmount, params.AmountOut)
 					// new intermediary hop
 				} else if isTheSame(params.TokenIn, final.RxToken) {
-					final.Path = append(final.Path, poolHop{final.RxToken, params.TokenOut})
+					final.Path = append(final.Path, &poolHop{final.RxToken, params.TokenOut})
 					final.RxToken = params.TokenOut // update
 					final.RxAmount = params.AmountOut
 					// same intermediary hop
@@ -263,7 +243,7 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender commo
 			} else {
 				final.SwapToken = params.TokenIn
 				final.RxToken = params.TokenOut
-				final.Path = []poolHop{{params.TokenIn, params.TokenOut}}
+				final.Path = []*poolHop{{params.TokenIn, params.TokenOut}}
 				final.SwapAmount = params.AmountInMaximum
 				final.RxAmount = params.AmountOut
 				final.rxFixed = true
@@ -271,15 +251,54 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender commo
 				firstTradeSet = true
 			}
 
-			/*return &tradeParams{
-				Recipient:  params.Recipient,
-				SwapToken:  params.TokenIn,
-				RxToken:    params.TokenOut,
-				Path:       []poolHop{{params.TokenIn, params.TokenOut}},
-				SwapAmount: params.AmountInMaximum,
-				RxAmount:   params.AmountOut,
-				rxFixed:    true,
-			}, nil*/
+		case "exactOutput":
+			fmt.Println("has UniV3 exactOutput")
+			paramsRaw, ok := inputArgs["params"]
+			if !ok || paramsRaw == nil {
+				return nil, errors.New("failed to get exactInput params")
+			}
+
+			params := UniswapV3Router2.IV3SwapRouterExactOutputParams(paramsRaw.(struct {
+				Path            []byte         `json:"path"`
+				Recipient       common.Address `json:"recipient"`
+				AmountOut       *big.Int       `json:"amountOut"`
+				AmountInMaximum *big.Int       `json:"amountInMaximum"`
+			}))
+
+			//spew.Dump("exactOutput input params:", params)
+
+			hops, err := getHopsFromMultiSwapPath(params.Path, true)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to decode MultiSwap Path arg")
+			}
+
+			//spew.Dump("with hops:", hops)
+
+			final.Recipient = inputRecipient(params.Recipient, sender)
+
+			if firstTradeSet {
+				if isTheSame(hops[0].In, final.SwapToken) && isTheSame(hops[len(hops)-1].Out, final.RxToken) {
+					final.SwapAmount.Add(final.SwapAmount, params.AmountInMaximum)
+					final.RxAmount.Add(final.RxAmount, params.AmountOut)
+				} else if isTheSame(hops[0].In, final.RxToken) { // intermediate hop
+					final.Path = append(final.Path, &poolHop{final.RxToken, hops[len(hops)-1].Out})
+					final.RxToken = hops[len(hops)-1].Out // update
+					final.RxAmount = params.AmountOut
+				} else if isTheSame(hops[len(hops)-1].Out, final.RxToken) { // same hop
+					final.RxAmount.Add(final.RxAmount, params.AmountOut)
+				} else {
+					return nil, errors.New("unhandled")
+				}
+			} else {
+				final.SwapToken = hops[0].In
+				final.RxToken = hops[len(hops)-1].Out
+				final.Path = hops
+				final.SwapAmount = params.AmountInMaximum
+				final.RxAmount = params.AmountOut
+				final.rxFixed = true
+
+				firstTradeSet = true
+			}
 
 		case "swapExactTokensForTokens":
 			fmt.Println("is UniV2 swapExactTokensForTokens")
@@ -295,7 +314,7 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender commo
 					final.SwapAmount.Add(final.SwapAmount, inputArgs["amountIn"].(*big.Int))
 					final.RxAmount.Add(final.RxAmount, inputArgs["amountOutMin"].(*big.Int))
 				} else if isTheSame(path[0], final.RxToken) { // intermediate hop
-					final.Path = append(final.Path, poolHop{final.RxToken, path[len(path)-1]})
+					final.Path = append(final.Path, &poolHop{final.RxToken, path[len(path)-1]})
 					final.RxToken = path[len(path)-1] // update
 					final.RxAmount = inputArgs["amountOutMin"].(*big.Int)
 				} else if isTheSame(path[len(path)-1], final.RxToken) { // same hop
@@ -306,23 +325,13 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender commo
 			} else {
 				final.SwapToken = path[0]
 				final.RxToken = path[len(path)-1]
-				final.Path = []poolHop{{path[0], path[len(path)-1]}}
+				final.Path = []*poolHop{{path[0], path[len(path)-1]}}
 				final.SwapAmount = inputArgs["amountIn"].(*big.Int)
 				final.RxAmount = inputArgs["amountOutMin"].(*big.Int)
 				final.rxFixed = false
 
 				firstTradeSet = true
 			}
-
-			/*return &tradeParams{
-				Recipient:  inputArgs["to"].(common.Address),
-				SwapToken:  path[0],
-				RxToken:    path[len(path)-1],
-				Path:       []poolHop{{path[0], path[len(path)-1]}},
-				SwapAmount: inputArgs["amountIn"].(*big.Int),
-				RxAmount:   inputArgs["amountOutMin"].(*big.Int),
-				rxFixed:    false,
-			}, nil*/
 
 		case "swapTokensForExactTokens":
 			fmt.Println("is UniV2 swapTokensForExactTokens")
@@ -336,7 +345,7 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender commo
 					final.SwapAmount.Add(final.SwapAmount, inputArgs["amountInMax"].(*big.Int))
 					final.RxAmount.Add(final.RxAmount, inputArgs["amountOut"].(*big.Int))
 				} else if isTheSame(path[0], final.RxToken) { // intermediate hop
-					final.Path = append(final.Path, poolHop{final.RxToken, path[len(path)-1]})
+					final.Path = append(final.Path, &poolHop{final.RxToken, path[len(path)-1]})
 					final.RxToken = path[len(path)-1] // update
 					final.RxAmount = inputArgs["amountOut"].(*big.Int)
 				} else if isTheSame(path[len(path)-1], final.RxToken) { // same hop
@@ -347,23 +356,13 @@ func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender commo
 			} else {
 				final.SwapToken = path[0]
 				final.RxToken = path[len(path)-1]
-				final.Path = []poolHop{{path[0], path[len(path)-1]}}
+				final.Path = []*poolHop{{path[0], path[len(path)-1]}}
 				final.SwapAmount = inputArgs["amountInMax"].(*big.Int)
 				final.RxAmount = inputArgs["amountOut"].(*big.Int)
 				final.rxFixed = true
 
 				firstTradeSet = true
 			}
-
-			/*return &tradeParams{
-				Recipient:  inputArgs["to"].(common.Address),
-				SwapToken:  path[0],
-				RxToken:    path[len(path)-1],
-				Path:       []poolHop{{path[0], path[len(path)-1]}},
-				SwapAmount: inputArgs["amountInMax"].(*big.Int),
-				RxAmount:   inputArgs["amountOut"].(*big.Int),
-				rxFixed:    true,
-			}, nil*/
 
 		default:
 			fmt.Println("warn: uniV3 multicall inner method not handled:", method.Name)
@@ -381,16 +380,22 @@ func inputRecipient(swapMethodRecipient, sender common.Address) common.Address {
 	return swapMethodRecipient // could also be addrThis
 }
 
-func getSwapsFromMultiSwapPath(path []byte) (swaps []poolHop, err error) {
+// sequence of trades to perform, with hops[0].In the Swap Token and hops[len(hops)-1].Out the Rx Token.
+// With 'exactOutput' the input path sequence is reversed.
+func getHopsFromMultiSwapPath(path []byte, isReversed bool) (hops []*poolHop, err error) {
 	if len(path) < 3+(2*common.AddressLength) {
 		err = errors.New("not long enough for first pool")
 		return
 	}
 
-	swaps = make([]poolHop, 1, 2)
+	hops = make([]*poolHop, 1, 2)
+	hops[0] = new(poolHop)
 
-	// swap token
-	swaps[0].In = common.BytesToAddress(path[:common.AddressLength])
+	if isReversed {
+		hops[0].Out = common.BytesToAddress(path[:common.AddressLength])
+	} else {
+		hops[0].In = common.BytesToAddress(path[:common.AddressLength])
+	}
 
 	//fmt.Print("multipath swap: {", swaps[0].In.Hex())
 	//defer fmt.Println("}")
@@ -400,8 +405,11 @@ func getSwapsFromMultiSwapPath(path []byte) (swaps []poolHop, err error) {
 	iPath += 3
 	//fmt.Printf(" - %d - ", fee)
 
-	// rx token from first pool
-	swaps[0].Out = common.BytesToAddress(path[iPath : iPath+common.AddressLength])
+	if isReversed {
+		hops[0].In = common.BytesToAddress(path[iPath : iPath+common.AddressLength])
+	} else {
+		hops[0].Out = common.BytesToAddress(path[iPath : iPath+common.AddressLength])
+	}
 	iPath += common.AddressLength
 	//fmt.Println(swaps[0].Out.Hex())
 
@@ -416,13 +424,25 @@ func getSwapsFromMultiSwapPath(path []byte) (swaps []poolHop, err error) {
 		iPath += 3
 		//fmt.Printf(" - %d - ", fee)
 
-		swaps = append(swaps, poolHop{
-			In:  swaps[len(swaps)-1].Out,
-			Out: common.BytesToAddress(path[iPath : iPath+common.AddressLength]),
-		})
+		ph := new(poolHop)
+		if isReversed {
+			ph.In = common.BytesToAddress(path[iPath : iPath+common.AddressLength])
+			ph.Out = hops[len(hops)-1].In
+		} else {
+			ph.In = hops[len(hops)-1].Out
+			ph.Out = common.BytesToAddress(path[iPath : iPath+common.AddressLength])
+		}
+
+		hops = append(hops, ph)
 		iPath += common.AddressLength
 
 		//fmt.Print(swaps[len(swaps)-1].Out.Hex())
+	}
+
+	if isReversed {
+		for i, j := 0, len(hops)-1; i < j; i, j = i+1, j-1 {
+			hops[i], hops[j] = hops[j], hops[i]
+		}
 	}
 	return
 }
