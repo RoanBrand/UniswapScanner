@@ -14,6 +14,8 @@ var (
 	// https://etherscan.io/address/0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45#code#F23#L11
 	addrMsgSender = common.BigToAddress(big.NewInt(1)) // the tx sender
 	addrThis      = common.BigToAddress(big.NewInt(2)) // the router
+
+	wETH9Addr = common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
 )
 
 // tradeParams is the tokens, path (pools involved), and intended amounts of a trade.
@@ -21,12 +23,13 @@ type tradeParams struct {
 	Recipient common.Address
 	SwapToken common.Address
 	RxToken   common.Address
-	Path      []*poolHop // all swaps (pools) from swapT to rxT
+	//Path      []*poolHop // all swaps (pools) from swapT to rxT
+	//intermediateTokens map[string]struct{}
 
 	SwapAmount *big.Int // AmountIn / AmountInMax
 	RxAmount   *big.Int // AmountOut / AmountOutMin
 
-	rxFixed bool // true: AmountOut, AmountInMax. false: AmountOutMin, AmountIn
+	//rxFixed bool // true: AmountOut, AmountInMax. false: AmountOutMin, AmountIn
 }
 
 // poolHop is a single swap (with a pool),
@@ -36,340 +39,264 @@ type poolHop struct {
 	Out common.Address
 }
 
-// get swap and rx tokens, trade path, and intended trade amounts.
-func (s *service) getSwapInput(txData []byte, sender common.Address) (*tradeParams, error) {
-	method, err := s.abiV3Router.MethodById(txData)
+// populate swap and rx tokens, and intended trade amounts, from the tx data.
+// trades can me single methods with multi hops, OR
+// multiple methods for intermediate token swaps if seemingly trading on uniV2 and V3
+func (s *service) populateTradeParams(tp *tradeParams, d []byte, sender common.Address) error {
+	method, err := s.abiV3Router.MethodById(d)
 	if err != nil {
-		return nil, errors.Wrap(err, "error getting method by id")
+		return errors.Wrap(err, "error getting method by id")
 	}
 	if method == nil {
-		return nil, errors.Errorf("method nil for %x", txData)
+		return errors.Errorf("method nil for %x", d)
 	}
 
 	fmt.Println("method:", method.Name)
 
-	inputArgs := make(map[string]interface{})
-	err = method.Inputs.UnpackIntoMap(inputArgs, txData[4:])
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to unpack method input args")
+	iArgs := make(map[string]interface{})
+	if err = method.Inputs.UnpackIntoMap(iArgs, d[4:]); err != nil {
+		return errors.Wrapf(err, "failed to unpack method '%s' input args", method.Name)
 	}
 
 	switch method.Name {
-	case "multicall0": // multicall(uint256 deadline, bytes[] data)
-		dataRaw, ok := inputArgs["data"]
-		if !ok || dataRaw == nil {
-			return nil, errors.New("unable to get uniswap v3 multicall input data")
+	case "multicall0", "multicall1", "multicall":
+		dRaw, ok := iArgs["data"]
+		if !ok || dRaw == nil {
+			return errors.Errorf("unable to get '%s' input data", method.Name)
 		}
 
-		data, ok := dataRaw.([][]byte)
+		dMulti, ok := dRaw.([][]byte)
 		if !ok {
-			return nil, errors.New("unable to get uniswap v3 multicall input data 2")
+			return errors.Errorf("unable to get '%s' input data 2", method.Name)
 		}
 
-		return s.getSwapInputDataFromUniV3Multicall(data, sender)
+		for _, d := range dMulti {
+			if err = s.populateTradeParams(tp, d, sender); err != nil {
+				return err
+			}
+		}
+
+	case "exactInputSingle":
+		fmt.Println("has UniV3 exactInputSingle")
+		pRaw, ok := iArgs["params"]
+		if !ok || pRaw == nil {
+			return errors.New("failed to get exactInputSingle params")
+		}
+
+		params := UniswapV3Router2.IV3SwapRouterExactInputSingleParams(pRaw.(struct {
+			TokenIn           common.Address `json:"tokenIn"`
+			TokenOut          common.Address `json:"tokenOut"`
+			Fee               *big.Int       `json:"fee"`
+			Recipient         common.Address `json:"recipient"`
+			AmountIn          *big.Int       `json:"amountIn"`
+			AmountOutMinimum  *big.Int       `json:"amountOutMinimum"`
+			SqrtPriceLimitX96 *big.Int       `json:"sqrtPriceLimitX96"`
+		}))
+
+		// spew.Dump("exactInputSingle input params:", params)
+		return tp.populateTradeMethodParams(
+			sender,
+			params.Recipient,
+			params.TokenIn, params.TokenOut,
+			params.AmountIn, params.AmountOutMinimum)
+
+	case "exactInput":
+		fmt.Println("has UniV3 exactInput")
+		paramsRaw, ok := iArgs["params"]
+		if !ok || paramsRaw == nil {
+			return errors.New("failed to get exactInput params")
+		}
+
+		params := UniswapV3Router2.IV3SwapRouterExactInputParams(paramsRaw.(struct {
+			Path             []byte         `json:"path"`
+			Recipient        common.Address `json:"recipient"`
+			AmountIn         *big.Int       `json:"amountIn"`
+			AmountOutMinimum *big.Int       `json:"amountOutMinimum"`
+		}))
+
+		//spew.Dump("exactInput input params:", params)
+		hops, err := getHopsFromMultiSwapPath(params.Path, false)
+		if err != nil {
+			return errors.Wrap(err, "failed to decode MultiSwap Path arg")
+		}
+
+		//spew.Dump("with hops:", hops)
+		return tp.populateTradeMethodParams(
+			sender,
+			params.Recipient,
+			hops[0].In, hops[len(hops)-1].Out,
+			params.AmountIn, params.AmountOutMinimum)
+
+	case "exactOutputSingle":
+		fmt.Println("has UniV3 exactOutputSingle")
+		paramsRaw, ok := iArgs["params"]
+		if !ok || paramsRaw == nil {
+			return errors.New("failed to get exactOutputSingle params")
+		}
+
+		// Cannot assert directly it seems
+		params := UniswapV3Router2.IV3SwapRouterExactOutputSingleParams(paramsRaw.(struct {
+			TokenIn           common.Address `json:"tokenIn"`
+			TokenOut          common.Address `json:"tokenOut"`
+			Fee               *big.Int       `json:"fee"`
+			Recipient         common.Address `json:"recipient"`
+			AmountOut         *big.Int       `json:"amountOut"`
+			AmountInMaximum   *big.Int       `json:"amountInMaximum"`
+			SqrtPriceLimitX96 *big.Int       `json:"sqrtPriceLimitX96"`
+		}))
+
+		//spew.Dump("exactOutputSingle input params:", params)
+		return tp.populateTradeMethodParams(
+			sender,
+			params.Recipient,
+			params.TokenIn, params.TokenOut,
+			params.AmountInMaximum, params.AmountOut)
+
+	case "exactOutput":
+		fmt.Println("has UniV3 exactOutput")
+		paramsRaw, ok := iArgs["params"]
+		if !ok || paramsRaw == nil {
+			return errors.New("failed to get exactOutput params")
+		}
+
+		params := UniswapV3Router2.IV3SwapRouterExactOutputParams(paramsRaw.(struct {
+			Path            []byte         `json:"path"`
+			Recipient       common.Address `json:"recipient"`
+			AmountOut       *big.Int       `json:"amountOut"`
+			AmountInMaximum *big.Int       `json:"amountInMaximum"`
+		}))
+
+		//spew.Dump("exactOutput input params:", params)
+		hops, err := getHopsFromMultiSwapPath(params.Path, true)
+		if err != nil {
+			return errors.Wrap(err, "failed to decode MultiSwap Path arg")
+		}
+
+		//spew.Dump("with hops:", hops)
+		return tp.populateTradeMethodParams(
+			sender,
+			params.Recipient,
+			hops[0].In, hops[len(hops)-1].Out,
+			params.AmountInMaximum, params.AmountOut)
+
+	case "swapExactTokensForTokens":
+		fmt.Println("is UniV2 swapExactTokensForTokens")
+		path := iArgs["path"].([]common.Address)
+
+		//spew.Dump("swapExactTokensForTokens input params:", iArgs)
+		return tp.populateTradeMethodParams(
+			sender,
+			iArgs["to"].(common.Address),
+			path[0], path[len(path)-1],
+			iArgs["amountIn"].(*big.Int), iArgs["amountOutMin"].(*big.Int))
+
+	case "swapTokensForExactTokens":
+		fmt.Println("is UniV2 swapTokensForExactTokens")
+		path := iArgs["path"].([]common.Address)
+
+		return tp.populateTradeMethodParams(
+			sender,
+			iArgs["to"].(common.Address),
+			path[0], path[len(path)-1],
+			iArgs["amountInMax"].(*big.Int), iArgs["amountOut"].(*big.Int))
+
+	case "unwrapWETH9":
+		//spew.Dump("unwrapWETH9 input params:", iArgs)
+
+		recip := iArgs["recipient"].(common.Address)
+		if isTheSame(recip, sender) {
+			if isSet(tp.RxToken) {
+				if !isTheSame(tp.RxToken, wETH9Addr) {
+					return errors.New("mixing rx currency with WETH9 Unwrap")
+				}
+			} else {
+				tp.RxToken = wETH9Addr
+				tp.Recipient = sender
+			}
+
+			tp.RxAmount.Add(tp.RxAmount, iArgs["amountMinimum"].(*big.Int))
+		}
 
 	default:
-		return nil, errors.New("unhandled method: " + method.Name)
+		fmt.Println("warn: uniV3 method not handled:", method.Name)
 	}
+
+	return err
 }
 
-// trades can me single methods with multi hops, OR
-// multiple methods for intermediate token swaps if seemingly trading on uniV2 and V3
-func (s *service) getSwapInputDataFromUniV3Multicall(data [][]byte, sender common.Address) (*tradeParams, error) {
-	final := &tradeParams{
-		SwapAmount: new(big.Int),
-		RxAmount:   new(big.Int),
-	}
-	firstTradeSet := false
+func (tp *tradeParams) populateTradeMethodParams(sender, recipient, tokenIn, tokenOut common.Address, amtIn, amtOut *big.Int) error {
+	recip := inputRecipient(recipient, sender) // TODO: will not get sender== receiver if rx currency uses Withdraw event
 
-	for _, d := range data {
-		method, err := s.abiV3Router.MethodById(d)
-		if err != nil {
-			return nil, errors.Wrap(err, "error getting uniV3 multicall inner method by id")
+	fmt.Printf("trade from %s to %s. recipient: %s. amount in: %s, amount out: %s\n", tokenIn, tokenOut, recip, amtIn.String(), amtOut.String())
+
+	if !isSet(tp.SwapToken) {
+		tp.SwapToken = tokenIn
+
+		if isTheSame(recip, sender) {
+			if isSet(tp.RxToken) {
+				return errors.New("multiple rx tokens 1")
+			}
+
+			tp.RxToken = tokenOut
+			tp.RxAmount.Add(tp.RxAmount, amtOut)
+			tp.Recipient = sender
+		} /*else {
+			tp.intermediateTokens[tokenOut.Hex()] = struct{}{}
+		}*/
+
+		tp.SwapAmount.Add(tp.SwapAmount, amtIn)
+
+	} else { // swap token already set
+
+		if isTheSame(tp.SwapToken, tokenIn) {
+			tp.SwapAmount.Add(tp.SwapAmount, amtIn)
 		}
-		if method == nil {
-			return nil, errors.Errorf("uniV3 multicall inner method nil for %x", data)
-		}
 
-		inputArgs := make(map[string]interface{})
-		err = method.Inputs.UnpackIntoMap(inputArgs, d[4:])
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to unpack uniV3 multicall inner method input args")
-		}
-
-		switch method.Name {
-		case "exactInputSingle":
-			fmt.Println("has UniV3 exactInputSingle")
-			paramsRaw, ok := inputArgs["params"]
-			if !ok || paramsRaw == nil {
-				return nil, errors.New("failed to get exactInputSingle params")
-			}
-
-			params := UniswapV3Router2.IV3SwapRouterExactInputSingleParams(paramsRaw.(struct {
-				TokenIn           common.Address `json:"tokenIn"`
-				TokenOut          common.Address `json:"tokenOut"`
-				Fee               *big.Int       `json:"fee"`
-				Recipient         common.Address `json:"recipient"`
-				AmountIn          *big.Int       `json:"amountIn"`
-				AmountOutMinimum  *big.Int       `json:"amountOutMinimum"`
-				SqrtPriceLimitX96 *big.Int       `json:"sqrtPriceLimitX96"`
-			}))
-
-			// spew.Dump("exactInputSingle input params:", params)
-
-			// final one should be sender, unless it currenct that uses Withdraw event,
-			// then it looks like it would be addrThis.
-			final.Recipient = inputRecipient(params.Recipient, sender)
-
-			if firstTradeSet {
-				// same initial hop
-				if isTheSame(params.TokenIn, final.SwapToken) && isTheSame(params.TokenOut, final.RxToken) {
-					final.SwapAmount.Add(final.SwapAmount, params.AmountIn)
-					final.RxAmount.Add(final.RxAmount, params.AmountOutMinimum)
-					// intermediate new hop
-				} else if isTheSame(params.TokenIn, final.RxToken) {
-					final.Path = append(final.Path, &poolHop{final.RxToken, params.TokenOut})
-					final.RxToken = params.TokenOut // update
-					final.RxAmount = params.AmountOutMinimum
-					// same intermediary hop
-				} else if isTheSame(params.TokenOut, final.RxToken) {
-					final.RxAmount.Add(final.RxAmount, params.AmountOutMinimum)
-				} else {
-					return nil, errors.New("unhandled")
+		if isTheSame(recip, sender) {
+			if isSet(tp.RxToken) {
+				if !isTheSame(tp.RxToken, tokenOut) {
+					return errors.New("multiple rx tokens 2")
 				}
 			} else {
-				final.SwapToken = params.TokenIn
-				final.RxToken = params.TokenOut
-				final.Path = []*poolHop{{params.TokenIn, params.TokenOut}}
-				final.SwapAmount = params.AmountIn
-				final.RxAmount = params.AmountOutMinimum
-				final.rxFixed = false
-
-				firstTradeSet = true
+				tp.RxToken = tokenOut
+				tp.Recipient = sender
 			}
 
-		case "exactInput":
-			fmt.Println("has UniV3 exactInput")
-			paramsRaw, ok := inputArgs["params"]
-			if !ok || paramsRaw == nil {
-				return nil, errors.New("failed to get exactInput params")
-			}
-
-			params := UniswapV3Router2.IV3SwapRouterExactInputParams(paramsRaw.(struct {
-				Path             []byte         `json:"path"`
-				Recipient        common.Address `json:"recipient"`
-				AmountIn         *big.Int       `json:"amountIn"`
-				AmountOutMinimum *big.Int       `json:"amountOutMinimum"`
-			}))
-
-			//spew.Dump("exactInput input params:", params)
-
-			hops, err := getHopsFromMultiSwapPath(params.Path, false)
-			if err != nil {
-				return nil, errors.Wrap(err, "failed to decode MultiSwap Path arg")
-			}
-
-			//spew.Dump("with paths:", swaps)
-
-			// final one should be sender
-			final.Recipient = inputRecipient(params.Recipient, sender)
-
-			if firstTradeSet {
-				// same initial hop
-				if isTheSame(hops[0].In, final.SwapToken) && isTheSame(hops[len(hops)-1].Out, final.RxToken) {
-					final.SwapAmount.Add(final.SwapAmount, params.AmountIn)
-					final.RxAmount.Add(final.RxAmount, params.AmountOutMinimum)
-					// new intermediary hop
-				} else if isTheSame(hops[0].In, final.RxToken) {
-					final.Path = append(final.Path, &poolHop{final.RxToken, hops[len(hops)-1].Out})
-					final.RxToken = hops[len(hops)-1].Out // update
-					final.RxAmount = params.AmountOutMinimum
-					// same intermediary hop
-				} else if isTheSame(hops[len(hops)-1].Out, final.RxToken) {
-					final.RxAmount.Add(final.RxAmount, params.AmountOutMinimum)
-				} else {
-					return nil, errors.New("unhandled")
-				}
-			} else {
-				final.SwapToken = hops[0].In
-				final.RxToken = hops[len(hops)-1].Out
-				final.Path = hops
-				final.SwapAmount = params.AmountIn
-				final.RxAmount = params.AmountOutMinimum
-				final.rxFixed = false
-
-				firstTradeSet = true
-			}
-
-		case "exactOutputSingle":
-			fmt.Println("has UniV3 exactOutputSingle")
-			paramsRaw, ok := inputArgs["params"]
-			if !ok || paramsRaw == nil {
-				return nil, errors.New("failed to get exactOutputSingle params")
-			}
-
-			// Cannot assert directly it seems
-			params := UniswapV3Router2.IV3SwapRouterExactOutputSingleParams(paramsRaw.(struct {
-				TokenIn           common.Address `json:"tokenIn"`
-				TokenOut          common.Address `json:"tokenOut"`
-				Fee               *big.Int       `json:"fee"`
-				Recipient         common.Address `json:"recipient"`
-				AmountOut         *big.Int       `json:"amountOut"`
-				AmountInMaximum   *big.Int       `json:"amountInMaximum"`
-				SqrtPriceLimitX96 *big.Int       `json:"sqrtPriceLimitX96"`
-			}))
-
-			//spew.Dump("exactOutputSingle input params:", params)
-
-			// final one should be sender
-			final.Recipient = inputRecipient(params.Recipient, sender)
-
-			if firstTradeSet {
-				// same initial hop
-				if isTheSame(params.TokenIn, final.SwapToken) && isTheSame(params.TokenOut, final.RxToken) {
-					final.SwapAmount.Add(final.SwapAmount, params.AmountInMaximum)
-					final.RxAmount.Add(final.RxAmount, params.AmountOut)
-					// new intermediary hop
-				} else if isTheSame(params.TokenIn, final.RxToken) {
-					final.Path = append(final.Path, &poolHop{final.RxToken, params.TokenOut})
-					final.RxToken = params.TokenOut // update
-					final.RxAmount = params.AmountOut
-					// same intermediary hop
-				} else if isTheSame(params.TokenOut, final.RxToken) {
-					final.RxAmount.Add(final.RxAmount, params.AmountOut)
-				} else {
-					return nil, errors.New("unhandled")
-				}
-			} else {
-				final.SwapToken = params.TokenIn
-				final.RxToken = params.TokenOut
-				final.Path = []*poolHop{{params.TokenIn, params.TokenOut}}
-				final.SwapAmount = params.AmountInMaximum
-				final.RxAmount = params.AmountOut
-				final.rxFixed = true
-
-				firstTradeSet = true
-			}
-
-		case "exactOutput":
-			fmt.Println("has UniV3 exactOutput")
-			paramsRaw, ok := inputArgs["params"]
-			if !ok || paramsRaw == nil {
-				return nil, errors.New("failed to get exactInput params")
-			}
-
-			params := UniswapV3Router2.IV3SwapRouterExactOutputParams(paramsRaw.(struct {
-				Path            []byte         `json:"path"`
-				Recipient       common.Address `json:"recipient"`
-				AmountOut       *big.Int       `json:"amountOut"`
-				AmountInMaximum *big.Int       `json:"amountInMaximum"`
-			}))
-
-			//spew.Dump("exactOutput input params:", params)
-
-			hops, err := getHopsFromMultiSwapPath(params.Path, true)
-			if err != nil {
-				return nil, errors.Wrap(err, "failed to decode MultiSwap Path arg")
-			}
-
-			//spew.Dump("with hops:", hops)
-
-			final.Recipient = inputRecipient(params.Recipient, sender)
-
-			if firstTradeSet {
-				if isTheSame(hops[0].In, final.SwapToken) && isTheSame(hops[len(hops)-1].Out, final.RxToken) {
-					final.SwapAmount.Add(final.SwapAmount, params.AmountInMaximum)
-					final.RxAmount.Add(final.RxAmount, params.AmountOut)
-				} else if isTheSame(hops[0].In, final.RxToken) { // intermediate hop
-					final.Path = append(final.Path, &poolHop{final.RxToken, hops[len(hops)-1].Out})
-					final.RxToken = hops[len(hops)-1].Out // update
-					final.RxAmount = params.AmountOut
-				} else if isTheSame(hops[len(hops)-1].Out, final.RxToken) { // same hop
-					final.RxAmount.Add(final.RxAmount, params.AmountOut)
-				} else {
-					return nil, errors.New("unhandled")
-				}
-			} else {
-				final.SwapToken = hops[0].In
-				final.RxToken = hops[len(hops)-1].Out
-				final.Path = hops
-				final.SwapAmount = params.AmountInMaximum
-				final.RxAmount = params.AmountOut
-				final.rxFixed = true
-
-				firstTradeSet = true
-			}
-
-		case "swapExactTokensForTokens":
-			fmt.Println("is UniV2 swapExactTokensForTokens")
-			path := inputArgs["path"].([]common.Address)
-
-			//spew.Dump("swapExactTokensForTokens path", path)
-
-			// final one should be sender
-			final.Recipient = inputRecipient(inputArgs["to"].(common.Address), sender)
-
-			if firstTradeSet {
-				if isTheSame(path[0], final.SwapToken) && isTheSame(path[len(path)-1], final.RxToken) {
-					final.SwapAmount.Add(final.SwapAmount, inputArgs["amountIn"].(*big.Int))
-					final.RxAmount.Add(final.RxAmount, inputArgs["amountOutMin"].(*big.Int))
-				} else if isTheSame(path[0], final.RxToken) { // intermediate hop
-					final.Path = append(final.Path, &poolHop{final.RxToken, path[len(path)-1]})
-					final.RxToken = path[len(path)-1] // update
-					final.RxAmount = inputArgs["amountOutMin"].(*big.Int)
-				} else if isTheSame(path[len(path)-1], final.RxToken) { // same hop
-					final.RxAmount.Add(final.RxAmount, inputArgs["amountOutMin"].(*big.Int))
-				} else {
-					return nil, errors.New("unhandled")
-				}
-			} else {
-				final.SwapToken = path[0]
-				final.RxToken = path[len(path)-1]
-				final.Path = []*poolHop{{path[0], path[len(path)-1]}}
-				final.SwapAmount = inputArgs["amountIn"].(*big.Int)
-				final.RxAmount = inputArgs["amountOutMin"].(*big.Int)
-				final.rxFixed = false
-
-				firstTradeSet = true
-			}
-
-		case "swapTokensForExactTokens":
-			fmt.Println("is UniV2 swapTokensForExactTokens")
-			path := inputArgs["path"].([]common.Address)
-
-			// final one should be sender
-			final.Recipient = inputRecipient(inputArgs["to"].(common.Address), sender)
-
-			if firstTradeSet {
-				if isTheSame(path[0], final.SwapToken) && isTheSame(path[len(path)-1], final.RxToken) {
-					final.SwapAmount.Add(final.SwapAmount, inputArgs["amountInMax"].(*big.Int))
-					final.RxAmount.Add(final.RxAmount, inputArgs["amountOut"].(*big.Int))
-				} else if isTheSame(path[0], final.RxToken) { // intermediate hop
-					final.Path = append(final.Path, &poolHop{final.RxToken, path[len(path)-1]})
-					final.RxToken = path[len(path)-1] // update
-					final.RxAmount = inputArgs["amountOut"].(*big.Int)
-				} else if isTheSame(path[len(path)-1], final.RxToken) { // same hop
-					final.RxAmount.Add(final.RxAmount, inputArgs["amountOut"].(*big.Int))
-				} else {
-					return nil, errors.New("unhandled")
-				}
-			} else {
-				final.SwapToken = path[0]
-				final.RxToken = path[len(path)-1]
-				final.Path = []*poolHop{{path[0], path[len(path)-1]}}
-				final.SwapAmount = inputArgs["amountInMax"].(*big.Int)
-				final.RxAmount = inputArgs["amountOut"].(*big.Int)
-				final.rxFixed = true
-
-				firstTradeSet = true
-			}
-
-		default:
-			fmt.Println("warn: uniV3 multicall inner method not handled:", method.Name)
-		}
+			tp.RxAmount.Add(tp.RxAmount, amtOut)
+		} /*else {
+			tp.intermediateTokens[tokenOut.Hex()] = struct{}{}
+		}*/
 	}
 
-	return final, nil
+	// final one should be sender, unless it currenct that uses Withdraw event,
+	// then it looks like it would be addrThis.
+	/*tp.Recipient = inputRecipient(recipient, sender)
+
+	if firstTradeSet {
+		// same initial hop
+		if isTheSame(tokenIn, tp.SwapToken) && isTheSame(tokenOut, tp.RxToken) {
+			tp.SwapAmount.Add(tp.SwapAmount, amtIn)
+			tp.RxAmount.Add(tp.RxAmount, amtOut)
+			// intermediate new hop
+		} else if isTheSame(tokenIn, tp.RxToken) {
+			//tp.Path = append(tp.Path, &poolHop{tp.RxToken, params.TokenOut})
+			tp.RxToken = tokenOut // update
+			tp.RxAmount = amtOut
+			// same intermediary hop
+		} else if isTheSame(tokenOut, tp.RxToken) {
+			tp.RxAmount.Add(tp.RxAmount, amtOut)
+		} else {
+			return errors.New("unhandled")
+		}
+	} else {
+		tp.SwapToken = tokenIn
+		tp.RxToken = tokenOut
+		//tp.Path = []*poolHop{{params.TokenIn, params.TokenOut}}
+		tp.SwapAmount = amtIn
+		tp.RxAmount = amtOut
+		//tp.rxFixed = false
+	}*/
+	return nil
 }
 
 func inputRecipient(swapMethodRecipient, sender common.Address) common.Address {

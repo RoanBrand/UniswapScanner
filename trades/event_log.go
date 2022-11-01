@@ -64,7 +64,7 @@ func (s *service) getTradedAmounts(logs []*types.Log, sender common.Address, si 
 				final.SwapAmount.Add(final.SwapAmount, new(big.Int).SetBytes(l.Data))
 			}
 		case uni3EventTopicWithdraw:
-			if isTheSame(l.Address, si.RxToken) && isTheSameHashLogAndHexAddress(l.Topics[1], uniV3Addr) {
+			if isTheSame(l.Address, si.RxToken) && isTheSameHashLogAndAddress(l.Topics[1], uniV3Addr) {
 				/*if final.RxAmount.Cmp(zero) != 0 {
 					return nil, errors.Errorf("event Withdraw: rxAmount already populated with %s, want to put in %s", final.RxAmount.String(), new(big.Int).SetBytes(l.Data).String())
 				}
@@ -119,6 +119,10 @@ func (s *service) getTradedAmounts(logs []*types.Log, sender common.Address, si 
 
 func isTheSame(addr1, addr2 common.Address) bool {
 	return bytes.Equal(addr1.Bytes(), addr2.Bytes())
+}
+
+func isSet(addr common.Address) bool {
+	return !isTheSame(addr, common.Address{})
 }
 
 // quick helper with no allocation

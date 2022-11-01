@@ -21,14 +21,16 @@ import (
 )
 
 const (
-	web3Url   = "https://mainnet.infura.io/v3/ca1921f56f88442cadfca449d53afeef"
-	uniV3Addr = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
+	web3Url = "https://mainnet.infura.io/v3/ca1921f56f88442cadfca449d53afeef"
 
 	confirmations uint64 = 267 // only scan up to (tip - confirmations)
-	startBlock    uint64 = 15767654
+	startBlock    uint64 = 15827318
 )
 
-var zero = new(big.Int)
+var (
+	zero      = new(big.Int)
+	uniV3Addr = common.HexToAddress("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")
+)
 
 type service struct {
 	ctx context.Context
@@ -126,7 +128,7 @@ func (s *service) decodeBlockTXs(txs types.Transactions, upToBlock uint64) error
 }
 
 func (s *service) decodeTx(tx *types.Transaction) error {
-	if tx.To() == nil || tx.To().Hex() != uniV3Addr {
+	if tx.To() == nil || !isTheSame(*tx.To(), uniV3Addr) {
 		return nil
 	}
 
@@ -151,36 +153,44 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 		return errors.Wrap(err, "failed to get TX sender")
 	}
 
-	swapInput, err := s.getSwapInput(tx.Data(), sender)
+	tp := tradeParams{
+		SwapAmount: new(big.Int),
+		RxAmount:   new(big.Int),
+	}
+
+	err = s.populateTradeParams(&tp, tx.Data(), sender)
 	if err != nil {
 		return errors.Wrap(err, "failed to get and decode method input args")
 	}
 
-	/*fmt.Println()
-	fmt.Println("Swap Input:")
-	spew.Dump(swapInput)*/
+	if !isSet(tp.Recipient) {
+		fmt.Println("input receiver not set. probably because receiver of trade proceeds != tx sender")
+		return nil
+	}
 
-	/*if !isTheSame(swapInput.Recipient, sender) {
-		return errors.New("CHECK. not sender")
-	}*/
+	if !isSet(tp.SwapToken) || !isSet(tp.RxToken) {
+		fmt.Println()
+		fmt.Println("Swap Input:")
+		spew.Dump(&tp)
+		return errors.New("CHECK. input not set")
+	}
 
-	tradedAmounts, err := s.getTradedAmounts(receipt.Logs, sender, swapInput)
+	tradedAmounts, err := s.getTradedAmounts(receipt.Logs, sender, &tp)
 	if err != nil {
 		return err
 	}
 
-	if isTheSame(tradedAmounts.Recipient, common.Address{}) {
-		// not set
+	if !isSet(tradedAmounts.Recipient) || tradedAmounts.SwapAmount.Cmp(zero) == 0 || tradedAmounts.RxAmount.Cmp(zero) == 0 {
 		fmt.Println("Swap Input:")
-		spew.Dump(swapInput)
+		spew.Dump(&tp)
 		fmt.Println()
 		fmt.Println("Final Traded amounts:")
 		spew.Dump(tradedAmounts)
-		return errors.New("CHECK. recipient not set")
+		return errors.New("CHECK. output not set")
 	}
 
 	// to check things while building/debugging:
-	if swapInput.rxFixed {
+	/*if swapInput.rxFixed {
 		if tradedAmounts.RxAmount.Cmp(zero) == 0 {
 			return errors.New("RxAmount not populated")
 		}
@@ -203,18 +213,11 @@ func (s *service) decodeTx(tx *types.Transaction) error {
 				return errors.Errorf("CHECK! Wanted swap amount %s not traded %s", swapInput.SwapAmount.String(), tradedAmounts.SwapAmount.String())
 			}
 		}
-	}
-
-	if tradedAmounts.RxAmount.Cmp(zero) == 0 {
-		return errors.New("RxAmount not populated 2")
-	}
-	if tradedAmounts.SwapAmount.Cmp(zero) == 0 {
-		return errors.New("SwapAmount not populated 2")
-	}
+	}*/
 
 	if !isTheSame(tradedAmounts.Recipient, sender) {
 		fmt.Println("recipient", tradedAmounts.Recipient, "not the same as sender. ignoring trade")
-		return nil // ignore traders on behalf of other wallets
+		return errors.New(":debug") // ignore traders on behalf of other wallets
 	}
 
 	/*fmt.Println("Final Traded amounts:")
